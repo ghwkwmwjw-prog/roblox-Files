@@ -1,0 +1,2347 @@
+<?xml version="1.0" encoding="utf-8"?>
+<roblox version="4">
+<Item class="Workspace" referent="RBX0"><Properties><string name="Name">Workspace</string></Properties><Item class="Terrain" referent="RBX9"><Properties><string name="Name">Terrain</string></Properties></Item></Item>
+<Item class="Lighting" referent="RBX1"><Properties><string name="Name">Lighting</string></Properties></Item>
+<Item class="ReplicatedStorage" referent="RBX2"><Properties><string name="Name">ReplicatedStorage</string></Properties></Item>
+<Item class="ServerScriptService" referent="RBX3"><Properties><string name="Name">ServerScriptService</string></Properties><Item class="Script" referent="RBX4"><Properties><string name="Name">HorrorMap_Server</string><ProtectedString name="Source"><![CDATA[--[[
+	========================================================
+	  حارة الأشباح  |  HorrorMap_Server
+	  نوع السكربت: Script (عادي)
+	  مكانه: ServerScriptService
+	========================================================
+	هذا السكربت يبني كل العالم (مكتب المدير، الطريق السريع، الحارة المسكونة)
+	ويدير المهام: الصندوق -> الدلائل -> 6 مفاتيح -> لغز الخزنة -> 30 جني -> البوابة
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local CollectionService = game:GetService("CollectionService")
+
+Players.CharacterAutoLoads = false
+math.randomseed(os.time())
+
+------------------------------------------------------------------
+-- إعدادات الأصوات (اختياري): الصق رقم الصوت من Creator Store مثل "rbxassetid://123456"
+-- الفراغ = بدون صوت
+------------------------------------------------------------------
+local CFG = {
+	Sounds = {
+		Shutter = "rbxasset://sounds/snap.mp3",
+		Switch = "rbxasset://sounds/switch.mp3",
+		Unlock = "rbxasset://sounds/button.wav",
+		Gun = "", -- صوت المسدس
+		Slam = "", -- صوت قفل البوابة
+		Whisper = "", -- همسات
+		Scare = "", -- صوت الرعب المفاجئ
+		Ghost = "", -- ظهور جني
+		Siren = "", -- صفارة الإنذار
+		Ambient = "", -- موسيقى رعب خلفية (تتكرر)
+	},
+}
+for k, v in pairs(CFG.Sounds) do
+	RS:SetAttribute("Snd_" .. k, v)
+end
+
+------------------------------------------------------------------
+-- Remotes
+------------------------------------------------------------------
+local ToClient = Instance.new("RemoteEvent")
+ToClient.Name = "ToClient"
+ToClient.Parent = RS
+local ToServer = Instance.new("RemoteEvent")
+ToServer.Name = "ToServer"
+ToServer.Parent = RS
+local Templates = Instance.new("Folder")
+Templates.Name = "Templates"
+Templates.Parent = RS
+
+------------------------------------------------------------------
+-- أدوات مساعدة
+------------------------------------------------------------------
+local function rgb(r, g, b)
+	return Color3.fromRGB(r, g, b)
+end
+
+local world = Instance.new("Folder")
+world.Name = "HorrorWorld"
+world.Parent = workspace
+
+local function mk(parent, name, size, cf, color, mat, transp)
+	local p = Instance.new("Part")
+	p.Name = name
+	p.Anchored = true
+	p.Size = size
+	if typeof(cf) == "Vector3" then
+		cf = CFrame.new(cf)
+	end
+	p.CFrame = cf
+	p.Color = color or rgb(60, 60, 60)
+	p.Material = mat or Enum.Material.SmoothPlastic
+	p.Transparency = transp or 0
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = parent
+	return p
+end
+
+local function addLight(parent, kind, color, brightness, range)
+	local l = Instance.new(kind)
+	l.Color = color
+	l.Brightness = brightness
+	l.Range = range
+	l.Parent = parent
+	return l
+end
+
+local function sgText(part, face, text, color)
+	local g = Instance.new("SurfaceGui")
+	g.Face = face
+	g.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+	g.PixelsPerStud = 30
+	g.Parent = part
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.fromScale(1, 1)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = color or rgb(255, 255, 255)
+	l.TextScaled = true
+	l.Font = Enum.Font.GothamBold
+	l.Parent = g
+	return l
+end
+
+local allLights = {} -- الأضواء اللي تتحول للأحمر
+local flickers = {} -- الأضواء اللي ترمش
+local function regLight(l, canFlicker)
+	l:SetAttribute("Orig", l.Color)
+	table.insert(allLights, l)
+	if canFlicker then
+		table.insert(flickers, { light = l, base = l.Brightness })
+	end
+end
+
+local mainPlayer = nil
+local function tell(...)
+	if mainPlayer and mainPlayer.Parent then
+		ToClient:FireClient(mainPlayer, ...)
+	end
+end
+local function sub(who, text, hold)
+	tell("Sub", who, text, hold or 2.5)
+end
+local function mission(text, pos)
+	tell("Mission", text, pos)
+end
+
+local function prompt(parent, action, object, hold, fn)
+	local pp = Instance.new("ProximityPrompt")
+	pp.ActionText = action
+	pp.ObjectText = object or ""
+	pp.HoldDuration = hold or 0.5
+	pp.MaxActivationDistance = 9
+	pp.RequiresLineOfSight = false
+	pp.Parent = parent
+	pp.Triggered:Connect(function(plr)
+		if plr == mainPlayer then
+			fn(plr)
+		end
+	end)
+	return pp
+end
+
+local function placeCar(car, cf)
+	car:PivotTo(cf * CFrame.new(0, 2, 0))
+end
+
+------------------------------------------------------------------
+-- الحالة العامة
+------------------------------------------------------------------
+-- stage: 0 مقدمة | 1 الصندوق | 2 الدلائل | 3 المفاتيح | 4 الأوراق والخزنة | 5 اخرج من البيت
+--        6 موجة الجن | 7 البوابة | 8 النهاية
+local State = {
+	stage = 0,
+	photos = { car = false, body = false },
+	keyStep = 0,
+	hasKey = {},
+	unlocked = {},
+	code = {},
+	notesGot = {},
+	noteCount = 0,
+	gear = false,
+	introStarted = false,
+}
+
+local KEYS = {
+	{ name = "النحاسي", color = rgb(205, 127, 50) },
+	{ name = "الأخضر", color = rgb(60, 220, 90) },
+	{ name = "الأزرق", color = rgb(70, 140, 255) },
+	{ name = "الأصفر", color = rgb(255, 220, 60) },
+	{ name = "البنفسجي", color = rgb(175, 90, 255) },
+	{ name = "الأبيض", color = rgb(255, 255, 255) },
+}
+
+------------------------------------------------------------------
+-- الإضاءة (ليل + ضباب)
+------------------------------------------------------------------
+local function setNight()
+	Lighting.ClockTime = 0
+	Lighting.Brightness = 0.6
+	Lighting.Ambient = rgb(20, 22, 32)
+	Lighting.OutdoorAmbient = rgb(28, 30, 44)
+	Lighting.FogColor = rgb(55, 62, 72)
+	Lighting.FogStart = 15
+	Lighting.FogEnd = 260
+	local atm = Lighting:FindFirstChildOfClass("Atmosphere") or Instance.new("Atmosphere")
+	atm.Density = 0.4
+	atm.Offset = 0.2
+	atm.Color = rgb(120, 130, 150)
+	atm.Decay = rgb(70, 80, 100)
+	atm.Glare = 0
+	atm.Haze = 1.6
+	atm.Parent = Lighting
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "HorrorCC"
+	cc.Saturation = -0.35
+	cc.Contrast = 0.12
+	cc.TintColor = rgb(215, 225, 255)
+	cc.Parent = Lighting
+end
+
+------------------------------------------------------------------
+-- شخصيات بسيطة (مدير / جثة)
+------------------------------------------------------------------
+local function makeFigure(name, cfg)
+	cfg = cfg or {}
+	local m = Instance.new("Model")
+	m.Name = name
+	local function limb(n, size, pos, col)
+		local p = mk(m, n, size, CFrame.new(pos), col)
+		p.CanCollide = false
+		return p
+	end
+	local shirt = cfg.shirt or rgb(40, 60, 120)
+	local skin = cfg.skin or rgb(235, 190, 150)
+	local pants = cfg.pants or rgb(30, 30, 40)
+	local torso = limb("Torso", Vector3.new(2, 2, 1), Vector3.new(0, 3, 0), shirt)
+	local head = limb("Head", Vector3.new(1.2, 1.2, 1.2), Vector3.new(0, 4.6, 0), skin)
+	limb("RArm", Vector3.new(1, 2, 1), Vector3.new(1.5, 3, 0), shirt)
+	limb("LArm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 3, 0), shirt)
+	limb("RLeg", Vector3.new(1, 2, 1), Vector3.new(0.5, 1, 0), pants)
+	limb("LLeg", Vector3.new(1, 2, 1), Vector3.new(-0.5, 1, 0), pants)
+	if cfg.face then
+		local d = Instance.new("Decal")
+		d.Texture = "rbxasset://textures/face.png"
+		d.Face = Enum.NormalId.Front
+		d.Parent = head
+	end
+	if cfg.cap then
+		limb("Cap", Vector3.new(1.4, 0.4, 1.4), Vector3.new(0, 5.35, 0), cfg.capColor or rgb(20, 25, 50))
+	end
+	m.PrimaryPart = torso
+	return m
+end
+
+------------------------------------------------------------------
+-- سيارة الشرطة
+------------------------------------------------------------------
+local function buildPoliceCar(opts)
+	opts = opts or {}
+	local m = Instance.new("Model")
+	m.Name = "PoliceCar"
+	local black, white = rgb(18, 18, 22), rgb(235, 235, 235)
+	local body = mk(m, "Body", Vector3.new(7, 2, 15), Vector3.new(0, 2, 0), black, Enum.Material.Metal)
+	mk(m, "Cabin", Vector3.new(6, 1.9, 7), Vector3.new(0, 3.95, 0.8), rgb(70, 90, 120), Enum.Material.Glass, 0.35)
+	mk(m, "Roof", Vector3.new(6.2, 0.3, 5.6), Vector3.new(0, 5.0, 0.8), black, Enum.Material.Metal)
+	local stripe = mk(m, "Stripe", Vector3.new(7.1, 1.1, 6), Vector3.new(0, 1.9, 1.2), white, Enum.Material.Metal)
+	sgText(stripe, Enum.NormalId.Right, "شرطة", rgb(10, 10, 10))
+	sgText(stripe, Enum.NormalId.Left, "شرطة", rgb(10, 10, 10))
+	local offs = {
+		Vector3.new(3.6, 1.2, -4.8),
+		Vector3.new(-3.6, 1.2, -4.8),
+		Vector3.new(3.6, 1.2, 4.8),
+		Vector3.new(-3.6, 1.2, 4.8),
+	}
+	for i, off in ipairs(offs) do
+		local w = mk(m, "Wheel" .. i, Vector3.new(0.9, 2.4, 2.4), CFrame.new(off), rgb(10, 10, 10))
+		w.Shape = Enum.PartType.Cylinder
+	end
+	for _, sx in ipairs({ -2.3, 2.3 }) do
+		local hl = mk(m, "Headlight", Vector3.new(1.3, 0.8, 0.3), Vector3.new(sx, 2.4, -7.6), rgb(255, 245, 200), Enum.Material.Neon)
+		local sp = addLight(hl, "SpotLight", rgb(255, 245, 210), 3, 90)
+		sp.Angle = 55
+		sp.Face = Enum.NormalId.Front
+		mk(m, "Taillight", Vector3.new(1.3, 0.6, 0.3), Vector3.new(sx, 2.5, 7.6), rgb(200, 20, 20), Enum.Material.Neon)
+	end
+	local rb = mk(m, "BarRed", Vector3.new(2, 0.5, 1), Vector3.new(-1.2, 5.35, 0.8), rgb(255, 30, 30), Enum.Material.Neon)
+	local bb = mk(m, "BarBlue", Vector3.new(2, 0.5, 1), Vector3.new(1.2, 5.35, 0.8), rgb(40, 80, 255), Enum.Material.Neon)
+	addLight(rb, "PointLight", rgb(255, 0, 0), opts.siren and 4 or 0, 30)
+	addLight(bb, "PointLight", rgb(0, 60, 255), 0, 30)
+	mk(m, "Trunk", Vector3.new(6.2, 0.4, 3), Vector3.new(0, 3.2, 6), black, Enum.Material.Metal)
+	local gear = mk(m, "Gear", Vector3.new(3.2, 1, 2), Vector3.new(0, 3.5, 6), rgb(40, 60, 40), Enum.Material.Fabric, 1)
+	gear.CanCollide = false
+	m.PrimaryPart = body
+	return m
+end
+
+------------------------------------------------------------------
+-- مكتب المدير
+------------------------------------------------------------------
+local OFFICE = Vector3.new(0, 500, 0)
+
+local function buildOffice()
+	local m = Instance.new("Model")
+	m.Name = "Office"
+	m.Parent = world
+	local o = OFFICE
+	local wallC = rgb(176, 170, 152)
+	mk(m, "Floor", Vector3.new(34, 1, 34), o + Vector3.new(0, -0.5, 0), rgb(72, 54, 38), Enum.Material.WoodPlanks)
+	mk(m, "Ceiling", Vector3.new(34, 1, 34), o + Vector3.new(0, 14.5, 0), rgb(205, 205, 198))
+	mk(m, "WallN", Vector3.new(34, 14, 1), o + Vector3.new(0, 7, -17), wallC)
+	mk(m, "WallS", Vector3.new(34, 14, 1), o + Vector3.new(0, 7, 17), wallC)
+	mk(m, "WallE", Vector3.new(1, 14, 34), o + Vector3.new(17, 7, 0), wallC)
+	mk(m, "WallW", Vector3.new(1, 14, 34), o + Vector3.new(-17, 7, 0), wallC)
+	local sign = mk(m, "Sign", Vector3.new(16, 4, 0.3), o + Vector3.new(0, 10, -16.4), rgb(15, 25, 55))
+	sgText(sign, Enum.NormalId.Back, "مديرية الشرطة", rgb(255, 215, 90))
+	mk(m, "Poster", Vector3.new(4, 5, 0.2), o + Vector3.new(-10, 8, -16.4), rgb(120, 30, 30))
+	mk(m, "Window", Vector3.new(0.3, 6, 8), o + Vector3.new(16.4, 8, -4), rgb(30, 50, 80), Enum.Material.Glass, 0.2)
+	mk(m, "Desk", Vector3.new(12, 0.6, 4.5), o + Vector3.new(0, 3.3, -8), rgb(90, 55, 30), Enum.Material.Wood)
+	mk(m, "DeskBody", Vector3.new(11, 3, 4), o + Vector3.new(0, 1.5, -8.2), rgb(70, 42, 24), Enum.Material.Wood)
+	local lamp = mk(m, "Lamp", Vector3.new(1, 1, 1), o + Vector3.new(4, 4.4, -8), rgb(255, 220, 150), Enum.Material.Neon)
+	lamp.Shape = Enum.PartType.Ball
+	addLight(lamp, "PointLight", rgb(255, 200, 130), 1.5, 30)
+	local cl = mk(m, "CeilLight", Vector3.new(6, 0.3, 2), o + Vector3.new(0, 13.8, -4), rgb(255, 250, 235), Enum.Material.Neon)
+	addLight(cl, "PointLight", rgb(255, 245, 225), 1, 45)
+	local mgr = makeFigure("Manager", { shirt = rgb(30, 50, 35), pants = rgb(25, 25, 30), face = true, cap = true })
+	mgr.Parent = m
+	mgr:PivotTo(CFrame.new(o + Vector3.new(0, 3, -11)) * CFrame.Angles(0, math.rad(180), 0))
+end
+
+------------------------------------------------------------------
+-- الطريق السريع الفاضي
+------------------------------------------------------------------
+local function lampPost(parent, pos, side, flick)
+	mk(parent, "Pole", Vector3.new(0.6, 16, 0.6), pos + Vector3.new(0, 8, 0), rgb(25, 25, 28), Enum.Material.Metal)
+	mk(parent, "Arm", Vector3.new(3.6, 0.4, 0.4), pos + Vector3.new(-side * 1.8, 16, 0), rgb(25, 25, 28), Enum.Material.Metal)
+	local head = mk(parent, "LampHead", Vector3.new(1.4, 0.6, 1.4), pos + Vector3.new(-side * 3.4, 15.6, 0), rgb(255, 230, 170), Enum.Material.Neon)
+	local l = addLight(head, "PointLight", rgb(255, 215, 150), 1.6, 48)
+	regLight(l, flick)
+end
+
+local function buildHighway()
+	local m = Instance.new("Model")
+	m.Name = "Highway"
+	m.Parent = world
+	mk(m, "Ground", Vector3.new(2400, 1, 2400), Vector3.new(200, -0.5, -800), rgb(22, 30, 22), Enum.Material.Grass)
+	mk(m, "Road", Vector3.new(30, 0.2, 1160), Vector3.new(200, 0.1, -540), rgb(35, 35, 38), Enum.Material.Asphalt)
+	local z = 20
+	while z > -1090 do
+		mk(m, "Dash", Vector3.new(0.5, 0.05, 6), Vector3.new(200, 0.23, z), rgb(230, 190, 40))
+		z -= 14
+	end
+	mk(m, "EdgeL", Vector3.new(0.4, 0.05, 1160), Vector3.new(186, 0.23, -540), rgb(210, 210, 210))
+	mk(m, "EdgeR", Vector3.new(0.4, 0.05, 1160), Vector3.new(214, 0.23, -540), rgb(210, 210, 210))
+	mk(m, "RailL", Vector3.new(0.4, 1.2, 1150), Vector3.new(182, 1.4, -525), rgb(110, 110, 115), Enum.Material.Metal)
+	mk(m, "RailR", Vector3.new(0.4, 1.2, 1150), Vector3.new(218, 1.4, -525), rgb(110, 110, 115), Enum.Material.Metal)
+	local i = 0
+	local lz = -20
+	while lz > -1060 do
+		i += 1
+		local side = (i % 2 == 0) and 1 or -1
+		lampPost(m, Vector3.new(200 + side * 24, 0, lz), side, math.random() < 0.35)
+		lz -= 70
+	end
+	for _ = 1, 90 do
+		local tz = math.random(-1090, 20)
+		local sgn = math.random(2) == 1 and 1 or -1
+		local x = 200 + sgn * (28 + math.random() * 80)
+		local h = 10 + math.random() * 8
+		mk(m, "Trunk", Vector3.new(1.6, h, 1.6), Vector3.new(x, h / 2, tz), rgb(30, 22, 18), Enum.Material.Wood)
+		local s = 7 + math.random() * 6
+		local lf = mk(m, "Leaves", Vector3.new(s, s, s), Vector3.new(x, h + s * 0.3, tz), rgb(14, 30, 18), Enum.Material.Grass)
+		lf.Shape = Enum.PartType.Ball
+	end
+end
+
+------------------------------------------------------------------
+-- الحارة المسكونة
+------------------------------------------------------------------
+local houses = {}
+local gateLeaves = {}
+local HING_L = CFrame.new(188, 7, -1100)
+local HING_R = CFrame.new(212, 7, -1100)
+
+local function setGate(deg)
+	local a = math.rad(deg)
+	gateLeaves.L:PivotTo(HING_L * CFrame.Angles(0, a, 0) * CFrame.new(6, 0, 0))
+	gateLeaves.R:PivotTo(HING_R * CFrame.Angles(0, -a, 0) * CFrame.new(-6, 0, 0))
+end
+
+local function makeLeaf(name)
+	local m = Instance.new("Model")
+	m.Name = name
+	local center = mk(m, "Center", Vector3.new(12, 11.4, 0.2), CFrame.new(0, 0, 0), rgb(50, 40, 35), Enum.Material.Metal, 1)
+	mk(m, "Top", Vector3.new(12, 0.6, 0.6), CFrame.new(0, 5.7, 0), rgb(45, 35, 30), Enum.Material.Metal)
+	mk(m, "Bottom", Vector3.new(12, 0.6, 0.6), CFrame.new(0, -5.7, 0), rgb(45, 35, 30), Enum.Material.Metal)
+	for k = -5, 5 do
+		mk(m, "Bar", Vector3.new(0.3, 11.4, 0.3), CFrame.new(k * 1.1, 0, 0), rgb(45, 35, 30), Enum.Material.Metal)
+	end
+	m.PrimaryPart = center
+	m.Parent = world
+	return m
+end
+
+local function buildHouse(parent, idx, cx, cz, dir)
+	local h = Instance.new("Model")
+	h.Name = "House" .. idx
+	h.Parent = parent
+	local H = 13
+	local v = math.random(-8, 8)
+	local wc = rgb(92 + v, 80 + v, 68 + v)
+	local mat = Enum.Material.Concrete
+	mk(h, "Floor", Vector3.new(34, 0.4, 28), Vector3.new(cx, 0.2, cz), rgb(60, 45, 32), Enum.Material.WoodPlanks)
+	mk(h, "Back", Vector3.new(1, H, 28), Vector3.new(cx - dir * 16.5, 0.4 + H / 2, cz), wc, mat)
+	local fx = cx + dir * 16.5
+	mk(h, "FrontA", Vector3.new(1, H, 11), Vector3.new(fx, 0.4 + H / 2, cz - 8.5), wc, mat)
+	mk(h, "FrontB", Vector3.new(1, H, 11), Vector3.new(fx, 0.4 + H / 2, cz + 8.5), wc, mat)
+	mk(h, "Lintel", Vector3.new(1, H - 9, 6), Vector3.new(fx, 0.4 + 9 + (H - 9) / 2, cz), wc, mat)
+	mk(h, "SideA", Vector3.new(34, H, 1), Vector3.new(cx, 0.4 + H / 2, cz - 14), wc, mat)
+	mk(h, "SideB", Vector3.new(34, H, 1), Vector3.new(cx, 0.4 + H / 2, cz + 14), wc, mat)
+	mk(h, "Roof", Vector3.new(36, 1, 30), Vector3.new(cx, 0.4 + H + 0.5, cz), rgb(35, 28, 28), Enum.Material.Slate)
+	-- أثاث
+	mk(h, "TableA", Vector3.new(4, 2.6, 3), Vector3.new(cx - dir * 9, 0.4 + 1.3, cz + 7), rgb(80, 52, 30), Enum.Material.Wood)
+	mk(h, "TableB", Vector3.new(4, 2.6, 3), Vector3.new(cx - dir * 9, 0.4 + 1.3, cz - 7), rgb(80, 52, 30), Enum.Material.Wood)
+	mk(h, "Bed", Vector3.new(6, 1.4, 3), Vector3.new(cx + dir * 9, 0.4 + 0.7, cz - 9), rgb(70, 60, 70), Enum.Material.Fabric)
+	-- ضوء داخلي خافت
+	local bulb = mk(h, "Bulb", Vector3.new(0.8, 0.8, 0.8), Vector3.new(cx, 0.4 + H - 1.2, cz), rgb(255, 200, 120), Enum.Material.Neon)
+	bulb.Shape = Enum.PartType.Ball
+	local l = addLight(bulb, "PointLight", rgb(255, 190, 110), 0.5, 26)
+	regLight(l, math.random() < 0.6)
+	local info = {
+		model = h,
+		center = Vector3.new(cx, 0.4, cz),
+		dir = dir,
+		doorPos = Vector3.new(fx, 0.4, cz),
+		tableA = Vector3.new(cx - dir * 9, 3.0, cz + 7),
+		tableB = Vector3.new(cx - dir * 9, 3.0, cz - 7),
+	}
+	table.insert(houses, info)
+end
+
+local STATION_DEFS = {
+	{ pos = Vector3.new(51, 0, -1250), normal = Vector3.new(1, 0, 0) },
+	{ pos = Vector3.new(349, 0, -1250), normal = Vector3.new(-1, 0, 0) },
+	{ pos = Vector3.new(51, 0, -1400), normal = Vector3.new(1, 0, 0) },
+	{ pos = Vector3.new(349, 0, -1400), normal = Vector3.new(-1, 0, 0) },
+	{ pos = Vector3.new(200, 0, -1499), normal = Vector3.new(0, 0, 1) },
+}
+local stations = {}
+
+local function buildStation(parent, i, def)
+	local k = KEYS[i]
+	local base = CFrame.lookAt(def.pos + def.normal * 0.45, def.pos + def.normal * 5)
+	local model = Instance.new("Model")
+	model.Name = "Station" .. i
+	model.Parent = parent
+	local plate = mk(model, "Plate", Vector3.new(9, 12, 0.8), base * CFrame.new(0, 6.4, 0), rgb(40, 38, 40), Enum.Material.Metal)
+	local fade = { plate }
+	table.insert(fade, mk(model, "StripeL", Vector3.new(0.5, 11, 0.2), base * CFrame.new(-3.2, 6.4, -0.5), k.color, Enum.Material.Neon))
+	table.insert(fade, mk(model, "StripeR", Vector3.new(0.5, 11, 0.2), base * CFrame.new(3.2, 6.4, -0.5), k.color, Enum.Material.Neon))
+	table.insert(fade, mk(model, "StripeT", Vector3.new(7, 0.5, 0.2), base * CFrame.new(0, 11.3, -0.5), k.color, Enum.Material.Neon))
+	table.insert(fade, mk(model, "Chain", Vector3.new(10, 0.4, 0.4), base * CFrame.new(0, 6, -0.7) * CFrame.Angles(0, 0, math.rad(8)), rgb(80, 80, 85), Enum.Material.Metal))
+	local lock = mk(model, "Lock", Vector3.new(1.8, 2.4, 1), base * CFrame.new(0, 5.2, -1), k.color, Enum.Material.Neon)
+	local lamp = mk(model, "Lamp", Vector3.new(1.4, 1.4, 1.4), base * CFrame.new(0, 14, -1.2), k.color, Enum.Material.Neon)
+	lamp.Shape = Enum.PartType.Ball
+	local pl = addLight(lamp, "PointLight", k.color, 0.5, 22)
+	local lb = sgText(plate, Enum.NormalId.Front, "قفل " .. k.name, rgb(225, 225, 225))
+	lb.Size = UDim2.fromScale(1, 0.18)
+	lb.Position = UDim2.fromScale(0, 0.06)
+	local s = { lock = lock, pos = def.pos + def.normal * 3 + Vector3.new(0, 5, 0) }
+	function s.unlock()
+		lock.Anchored = false
+		lock.CanCollide = true
+		pl.Brightness = 3
+		pl.Range = 40
+		for _, p in ipairs(fade) do
+			p.CanCollide = false
+			TweenService:Create(p, TweenInfo.new(1.4), { Transparency = 1 }):Play()
+		end
+		Debris:AddItem(lock, 6)
+	end
+	stations[i] = s
+	return s
+end
+
+local function buildNeighborhood()
+	local n = Instance.new("Model")
+	n.Name = "Neighborhood"
+	n.Parent = world
+	mk(n, "Yard", Vector3.new(300, 0.2, 400), Vector3.new(200, 0.1, -1300), rgb(40, 36, 32), Enum.Material.Slate)
+	mk(n, "MainStreet", Vector3.new(20, 0.1, 400), Vector3.new(200, 0.25, -1300), rgb(32, 32, 35), Enum.Material.Asphalt)
+	mk(n, "Cross1", Vector3.new(300, 0.1, 16), Vector3.new(200, 0.25, -1250), rgb(32, 32, 35), Enum.Material.Asphalt)
+	mk(n, "Cross2", Vector3.new(300, 0.1, 16), Vector3.new(200, 0.25, -1400), rgb(32, 32, 35), Enum.Material.Asphalt)
+	local wallC = rgb(55, 50, 48)
+	local wm = Enum.Material.Brick
+	mk(n, "WallN", Vector3.new(300, 24, 2), Vector3.new(200, 12, -1500), wallC, wm)
+	mk(n, "WallW", Vector3.new(2, 24, 400), Vector3.new(50, 12, -1300), wallC, wm)
+	mk(n, "WallE", Vector3.new(2, 24, 400), Vector3.new(350, 12, -1300), wallC, wm)
+	mk(n, "WallSW", Vector3.new(138, 24, 2), Vector3.new(119, 12, -1100), wallC, wm)
+	mk(n, "WallSE", Vector3.new(138, 24, 2), Vector3.new(281, 12, -1100), wallC, wm)
+	mk(n, "PillarL", Vector3.new(4, 20, 4), Vector3.new(186, 10, -1100), rgb(45, 42, 42), wm)
+	mk(n, "PillarR", Vector3.new(4, 20, 4), Vector3.new(214, 10, -1100), rgb(45, 42, 42), wm)
+	local arch = mk(n, "Arch", Vector3.new(34, 6, 3), Vector3.new(200, 22, -1100), rgb(40, 38, 38), wm)
+	sgText(arch, Enum.NormalId.Back, "الحارة المسكونة", rgb(200, 40, 40))
+	gateLeaves.L = makeLeaf("GateL")
+	gateLeaves.R = makeLeaf("GateR")
+	setGate(90) -- مفتوحة في البداية
+
+	local cols = { { x = 100, dir = 1 }, { x = 155, dir = 1 }, { x = 245, dir = -1 }, { x = 300, dir = -1 } }
+	local rows = { -1160, -1210, -1300, -1350, -1450 }
+	local idx = 0
+	for _, r in ipairs(rows) do
+		for _, c in ipairs(cols) do
+			idx += 1
+			buildHouse(n, idx, c.x, r, c.dir)
+		end
+	end
+	local k = 0
+	local lz = -1140
+	while lz > -1490 do
+		k += 1
+		local side = (k % 2 == 0) and 1 or -1
+		lampPost(n, Vector3.new(200 + side * 12, 0, lz), side, math.random() < 0.5)
+		lz -= 45
+	end
+	for i, def in ipairs(STATION_DEFS) do
+		buildStation(n, i, def)
+	end
+end
+
+------------------------------------------------------------------
+-- بناء العالم
+------------------------------------------------------------------
+setNight()
+buildOffice()
+buildHighway()
+buildNeighborhood()
+
+do -- قالب سيارة الشرطة (للمقدمة السينمائية)
+	local tpl = buildPoliceCar({})
+	tpl.Parent = Templates
+end
+
+if CFG.Sounds.Ambient ~= "" then
+	local s = Instance.new("Sound")
+	s.SoundId = CFG.Sounds.Ambient
+	s.Looped = true
+	s.Volume = 0.5
+	s.Parent = workspace
+	s:Play()
+end
+
+-- توزيع الأدوار على البيوت عشوائياً
+local order = {}
+for i = 1, #houses do
+	order[i] = i
+end
+for i = #order, 2, -1 do
+	local j = math.random(i)
+	order[i], order[j] = order[j], order[i]
+end
+local roles = { body = houses[order[1]], keys = {}, notes = {}, safe = houses[order[11]], ritual = {} }
+for i = 1, 5 do
+	roles.keys[i] = houses[order[1 + i]]
+end
+for i = 1, 4 do
+	roles.notes[i] = houses[order[6 + i]]
+end
+for i = 1, 3 do
+	roles.ritual[i] = houses[order[11 + i]]
+end
+
+-- الجثة
+local bodyModel
+do
+	local b = makeFigure("DeadOfficer", { shirt = rgb(30, 45, 90), pants = rgb(20, 25, 45), skin = rgb(190, 175, 165), face = true, cap = true })
+	b.Parent = world
+	local h = roles.body
+	b:PivotTo(CFrame.new(h.center.X - h.dir * 4, 0.4 + 0.5, h.center.Z) * CFrame.Angles(math.rad(90), math.rad(math.random(-20, 20)), 0))
+	local pool = mk(world, "Blood", Vector3.new(0.1, 7, 7), CFrame.new(h.center.X - h.dir * 4, 0.45, h.center.Z) * CFrame.Angles(0, 0, math.rad(90)), rgb(95, 0, 0))
+	pool.Shape = Enum.PartType.Cylinder
+	pool.CanCollide = false
+	bodyModel = b
+end
+
+-- سيارة الشرطي المتكسرة (مع صفارة تشتغل)
+local WRECK_POS = Vector3.new(196, 0.9, -1290)
+local wreck
+do
+	wreck = buildPoliceCar({ siren = true })
+	wreck.Name = "WreckedPoliceCar"
+	placeCar(wreck, CFrame.new(WRECK_POS) * CFrame.Angles(math.rad(5), math.rad(28), math.rad(11)))
+	wreck.Parent = world
+	local smokeSrc = mk(wreck, "SmokeSrc", Vector3.new(1, 1, 1), wreck.Body.CFrame * CFrame.new(0, 2, -5.5), rgb(0, 0, 0), nil, 1)
+	smokeSrc.CanCollide = false
+	local pe = Instance.new("ParticleEmitter")
+	pe.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	pe.Color = ColorSequence.new(rgb(70, 70, 70))
+	pe.Size = NumberSequence.new(2, 6)
+	pe.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 1) })
+	pe.Lifetime = NumberRange.new(2.5, 4)
+	pe.Rate = 10
+	pe.Speed = NumberRange.new(3, 5)
+	pe.EmissionDirection = Enum.NormalId.Top
+	pe.Parent = smokeSrc
+	local rl = wreck.BarRed:FindFirstChildOfClass("PointLight")
+	local bl = wreck.BarBlue:FindFirstChildOfClass("PointLight")
+	task.spawn(function()
+		local on = false
+		while true do
+			on = not on
+			rl.Brightness = on and 4 or 0
+			bl.Brightness = on and 0 or 4
+			task.wait(0.3)
+		end
+	end)
+end
+
+-- رمشة الأضواء
+task.spawn(function()
+	while true do
+		task.wait(0.12)
+		for _, f in ipairs(flickers) do
+			if f.light.Parent and math.random() < 0.08 then
+				f.light.Brightness = (math.random() < 0.5) and 0 or f.base
+			elseif f.light.Parent and math.random() < 0.3 then
+				f.light.Brightness = f.base
+			end
+		end
+	end
+end)
+
+------------------------------------------------------------------
+-- الأضواء الحمراء (لما يبدأ الرعب)
+------------------------------------------------------------------
+local redOn = false
+local function redLights(on)
+	redOn = on
+	local ti = TweenInfo.new(2)
+	local cc = Lighting:FindFirstChild("HorrorCC")
+	if on then
+		TweenService:Create(Lighting, ti, { Ambient = rgb(70, 5, 5), OutdoorAmbient = rgb(110, 8, 8), FogColor = rgb(80, 8, 8) }):Play()
+		if cc then
+			TweenService:Create(cc, ti, { TintColor = rgb(255, 130, 130) }):Play()
+		end
+		for _, l in ipairs(allLights) do
+			l.Color = rgb(255, 40, 40)
+		end
+		task.spawn(function()
+			local up = true
+			while redOn do
+				TweenService:Create(Lighting, TweenInfo.new(0.9, Enum.EasingStyle.Sine), { OutdoorAmbient = up and rgb(160, 12, 12) or rgb(60, 3, 3) }):Play()
+				up = not up
+				task.wait(0.9)
+			end
+		end)
+	else
+		TweenService:Create(Lighting, ti, { Ambient = rgb(20, 22, 32), OutdoorAmbient = rgb(28, 30, 44), FogColor = rgb(55, 62, 72) }):Play()
+		if cc then
+			TweenService:Create(cc, ti, { TintColor = rgb(215, 225, 255) }):Play()
+		end
+		for _, l in ipairs(allLights) do
+			l.Color = l:GetAttribute("Orig") or rgb(255, 200, 130)
+		end
+	end
+end
+
+------------------------------------------------------------------
+-- الأدوات (مسدس / كشاف / جوال)
+------------------------------------------------------------------
+local function weldTo(handle, part, offset)
+	local w = Instance.new("Weld")
+	w.Part0 = handle
+	w.Part1 = part
+	w.C0 = offset
+	w.Parent = handle
+end
+
+local function newTool(name, size, color)
+	local t = Instance.new("Tool")
+	t.Name = name
+	t.CanBeDropped = false
+	t.RequiresHandle = true
+	t.GripForward = Vector3.new(-1, 0, 0)
+	t.GripRight = Vector3.new(0, 1, 0)
+	t.GripUp = Vector3.new(0, 0, 1)
+	local h = Instance.new("Part")
+	h.Name = "Handle"
+	h.Size = size
+	h.Color = color
+	h.Material = Enum.Material.Metal
+	h.CanCollide = false
+	h.Parent = t
+	return t, h
+end
+
+local function extraPart(tool, handle, size, offset, color, mat)
+	local p = Instance.new("Part")
+	p.Size = size
+	p.Color = color
+	p.Material = mat or Enum.Material.Metal
+	p.CanCollide = false
+	p.Massless = true
+	p.Parent = tool
+	weldTo(handle, p, offset)
+	return p
+end
+
+local function giveGear()
+	local plr = mainPlayer
+	if not plr then
+		return
+	end
+	local bp = plr:WaitForChild("Backpack", 5)
+	if not bp then
+		return
+	end
+	for _, n in ipairs({ "Pistol", "Flashlight", "Phone" }) do
+		local old = bp:FindFirstChild(n)
+		if old then
+			old:Destroy()
+		end
+	end
+	-- مسدس
+	local pistol, ph = newTool("Pistol", Vector3.new(0.35, 0.5, 1.5), rgb(25, 25, 28))
+	pistol.ToolTip = "مسدس"
+	extraPart(pistol, ph, Vector3.new(0.3, 1, 0.45), CFrame.new(0, -0.7, -0.45), rgb(20, 20, 20))
+	pistol.Parent = bp
+	-- كشاف
+	local fl, fh = newTool("Flashlight", Vector3.new(0.5, 0.5, 1.6), rgb(80, 80, 90))
+	fl.ToolTip = "كشاف"
+	extraPart(fl, fh, Vector3.new(0.9, 0.9, 0.5), CFrame.new(0, 0, 1.0), rgb(255, 240, 180), Enum.Material.Neon)
+	fl.Equipped:Connect(function()
+		local char = fl.Parent
+		local head = char and char:FindFirstChild("Head")
+		if head and not head:FindFirstChild("FlashBeam") then
+			local sl = Instance.new("SpotLight")
+			sl.Name = "FlashBeam"
+			sl.Brightness = 4
+			sl.Range = 60
+			sl.Angle = 55
+			sl.Face = Enum.NormalId.Front
+			sl.Color = rgb(255, 245, 215)
+			sl.Parent = head
+		end
+	end)
+	fl.Unequipped:Connect(function()
+		local head = plr.Character and plr.Character:FindFirstChild("Head")
+		local b = head and head:FindFirstChild("FlashBeam")
+		if b then
+			b:Destroy()
+		end
+	end)
+	fl.Activated:Connect(function()
+		local head = plr.Character and plr.Character:FindFirstChild("Head")
+		local b = head and head:FindFirstChild("FlashBeam")
+		if b then
+			b.Enabled = not b.Enabled
+			tell("Sfx", "Switch")
+		end
+	end)
+	fl.Parent = bp
+	-- جوال
+	local ph2, phh = newTool("Phone", Vector3.new(0.9, 0.12, 1.7), rgb(15, 15, 18))
+	ph2.ToolTip = "جوال - صوّر الدلائل"
+	extraPart(ph2, phh, Vector3.new(0.8, 0.02, 1.5), CFrame.new(0, 0.07, 0), rgb(70, 130, 255), Enum.Material.Neon)
+	ph2.Parent = bp
+end
+
+------------------------------------------------------------------
+-- اللاعب: ظهور وموت
+------------------------------------------------------------------
+local SPAWN_CF = CFrame.new(191.5, 4, -1117)
+
+local function respawnCF()
+	if State.stage >= 6 then
+		return CFrame.new(200, 4, -1160)
+	end
+	return SPAWN_CF
+end
+
+local function spawnPlayer(cf)
+	if not mainPlayer then
+		return
+	end
+	mainPlayer:LoadCharacter()
+	local char = mainPlayer.Character or mainPlayer.CharacterAdded:Wait()
+	char:WaitForChild("HumanoidRootPart")
+	char:PivotTo(cf)
+	local hum = char:WaitForChild("Humanoid")
+	hum.WalkSpeed = 15
+	if State.gear then
+		giveGear()
+	end
+	hum.Died:Connect(function()
+		tell("Died")
+		task.wait(4)
+		if mainPlayer and mainPlayer.Parent and State.stage >= 1 and State.stage < 8 then
+			spawnPlayer(respawnCF())
+			tell("Revived")
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- القصة: المفاتيح والأقفال
+------------------------------------------------------------------
+local function nearest(list, getPos)
+	local char = mainPlayer and mainPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local best, bd = nil, math.huge
+	for k, item in pairs(list) do
+		local p = getPos(item, k)
+		if p then
+			local d = hrp and (hrp.Position - p).Magnitude or 0
+			if d < bd then
+				best, bd = p, d
+			end
+		end
+	end
+	return best
+end
+
+local function makeKeyModel(color)
+	local m = Instance.new("Model")
+	m.Name = "Key"
+	local ring = mk(m, "Ring", Vector3.new(0.3, 1.8, 1.8), CFrame.new(0, 0, 0), color, Enum.Material.Neon)
+	ring.Shape = Enum.PartType.Cylinder
+	mk(m, "Shaft", Vector3.new(0.3, 0.4, 2.6), CFrame.new(0, 0, -2.1), color, Enum.Material.Neon)
+	mk(m, "Tooth1", Vector3.new(0.3, 0.9, 0.4), CFrame.new(0, -0.5, -3.0), color, Enum.Material.Neon)
+	mk(m, "Tooth2", Vector3.new(0.3, 0.7, 0.4), CFrame.new(0, -0.4, -2.2), color, Enum.Material.Neon)
+	for _, p in ipairs(m:GetChildren()) do
+		p.CanCollide = false
+	end
+	addLight(ring, "PointLight", color, 1.2, 14)
+	m.PrimaryPart = ring
+	return m
+end
+
+local function spawnKey(i, pos, onPick)
+	local km = makeKeyModel(KEYS[i].color)
+	km.Name = "Key" .. i
+	km:PivotTo(CFrame.new(pos + Vector3.new(0, 1.3, 0)))
+	km.Parent = world
+	km:SetAttribute("Base", km:GetPivot())
+	CollectionService:AddTag(km, "Spin")
+	prompt(km.Ring, "التقاط", "المفتاح " .. KEYS[i].name, 0.5, function()
+		km:Destroy()
+		onPick()
+	end)
+end
+
+local nextKeyStep, startNotes, startWave
+
+local function unlockStation(i)
+	State.unlocked[i] = true
+	tell("Sfx", "Unlock")
+	stations[i].unlock()
+	sub("أنا", "انفتح قفل " .. KEYS[i].name .. "!", 2.5)
+	task.delay(2.5, nextKeyStep)
+end
+
+function nextKeyStep()
+	State.keyStep += 1
+	local i = State.keyStep
+	if i > 5 then
+		startNotes()
+		return
+	end
+	local h = roles.keys[i]
+	spawnKey(i, h.tableA, function()
+		State.hasKey[i] = true
+		tell("Sfx", "Switch")
+		sub("أنا", "حصلت على المفتاح " .. KEYS[i].name .. ".. أبحث عن قفله.", 3)
+		mission(("افتح القفل %s (%d/6)"):format(KEYS[i].name, i), stations[i].pos)
+	end)
+	mission(("ابحث عن المفتاح %s (%d/6)"):format(KEYS[i].name, i), h.tableA)
+end
+
+-- أقفال الأبواب الخمسة
+for i = 1, 5 do
+	prompt(stations[i].lock, "فتح القفل", "القفل " .. KEYS[i].name, 1, function()
+		if State.stage ~= 3 or State.unlocked[i] then
+			return
+		end
+		if State.hasKey[i] then
+			unlockStation(i)
+		else
+			sub("أنا", "أحتاج المفتاح " .. KEYS[i].name .. " أولاً.", 2.5)
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- الأوراق + الخزنة (لغز المفتاح الأبيض)
+------------------------------------------------------------------
+local safeDoor, safeBody, safePos
+
+local function nearestNotePos()
+	return nearest(roles.notes, function(h, k)
+		if State.notesGot[k] then
+			return nil
+		end
+		return h.tableB
+	end)
+end
+
+local function buildSafe()
+	local h = roles.safe
+	safePos = Vector3.new(h.center.X - h.dir * 14.8, 0.4 + 1.5, h.center.Z)
+	safeBody = mk(world, "Safe", Vector3.new(2.4, 3, 3.2), safePos, rgb(60, 62, 68), Enum.Material.Metal)
+	safeDoor = mk(world, "SafeDoor", Vector3.new(0.3, 2.6, 2.8), safePos + Vector3.new(h.dir * 1.35, 0, 0), rgb(85, 88, 95), Enum.Material.Metal)
+	local dial = mk(world, "Dial", Vector3.new(0.6, 0.6, 0.3), safePos + Vector3.new(h.dir * 1.6, 0, 0), rgb(255, 255, 255), Enum.Material.Neon)
+	dial.Shape = Enum.PartType.Ball
+	prompt(safeBody, "فتح الخزنة", "خزنة قديمة", 0.6, function()
+		if State.stage ~= 4 then
+			return
+		end
+		if State.noteCount < 4 then
+			sub("أنا", "خزنة بقفل رقمي.. لازم ألقى الأوراق الأربع أول.", 3)
+			return
+		end
+		tell("Keypad")
+	end)
+end
+buildSafe()
+
+local function openSafe()
+	local h = roles.safe
+	State.stage = 5
+	tell("Sfx", "Unlock")
+	local hinge = safeDoor.CFrame * CFrame.new(0, 0, -1.4)
+	local target = hinge * CFrame.Angles(0, h.dir * math.rad(100), 0) * CFrame.new(0, 0, 1.4)
+	TweenService:Create(safeDoor, TweenInfo.new(1.2), { CFrame = target }):Play()
+	spawnKey(6, safePos + Vector3.new(h.dir * 0.2, -0.6, 0), function()
+		State.hasKey[6] = true
+		sub("أنا", "المفتاح الأبيض!.. لازم أطلع من هذا البيت بسرعة.", 3)
+		mission("اخرج من البيت", h.doorPos)
+		task.spawn(function()
+			while State.stage == 5 do
+				local char = mainPlayer and mainPlayer.Character
+				local hrp = char and char:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local rel = hrp.Position - h.center
+					if math.abs(rel.X) > 18.5 or math.abs(rel.Z) > 15.5 then
+						startWave()
+						break
+					end
+				end
+				task.wait(0.4)
+			end
+		end)
+	end)
+	mission("خذ المفتاح الأبيض من الخزنة", safePos)
+end
+
+function startNotes()
+	State.stage = 4
+	State.code = { math.random(1, 9), math.random(0, 9), math.random(0, 9), math.random(0, 9) }
+	for k = 1, 4 do
+		local h = roles.notes[k]
+		local paper = mk(world, "Note" .. k, Vector3.new(1.6, 0.1, 2), CFrame.new(h.tableB + Vector3.new(0, 0.1, 0)) * CFrame.Angles(0, math.rad(math.random(-40, 40)), 0), rgb(235, 225, 190))
+		paper.CanCollide = false
+		addLight(paper, "PointLight", rgb(255, 240, 200), 0.8, 10)
+		prompt(paper, "قراءة الورقة", "ورقة ممزقة", 0.4, function()
+			if State.notesGot[k] then
+				return
+			end
+			State.notesGot[k] = true
+			State.noteCount += 1
+			paper:Destroy()
+			tell("NoteDigit", k, State.code[k])
+			sub("أنا", ("ورقة %d: الرقم %d"):format(k, State.code[k]), 3)
+			if State.noteCount >= 4 then
+				mission("جمعت الأرقام.. افتح الخزنة", safePos)
+			else
+				mission(("ابحث عن أوراق الرمز (%d/4)"):format(State.noteCount), nearestNotePos())
+			end
+		end)
+	end
+	sub("أنا", "المفتاح الأخير مقفل في خزنة.. أكيد الرمز مكتوب في أوراق مبعثرة بالبيوت.", 4)
+	mission("ابحث عن أوراق الرمز (0/4)", nearestNotePos())
+end
+
+------------------------------------------------------------------
+-- الموجة الحمراء: 30 جني
+------------------------------------------------------------------
+function startWave()
+	if State.stage ~= 5 then
+		return
+	end
+	State.stage = 6
+	tell("Stalker", false)
+	tell("Halluc", false)
+	redLights(true)
+	tell("Sfx", "Siren")
+	tell("Wave", 30)
+	sub("أنا", "اشتغلت الأضواء الحمراء!.. هذي الجن.. لازم أقتلهم كلهم!", 4)
+	mission("اقتل الجن (30)", nil)
+end
+
+local gateLock
+local function buildGateLock()
+	gateLock = mk(world, "WhiteLock", Vector3.new(2.2, 3, 1.2), Vector3.new(200, 6, -1100.9), rgb(255, 255, 255), Enum.Material.Neon)
+	mk(world, "GateChain", Vector3.new(24, 0.5, 0.5), CFrame.new(200, 6.6, -1100.6) * CFrame.Angles(0, 0, math.rad(3)), rgb(70, 70, 75), Enum.Material.Metal)
+	addLight(gateLock, "PointLight", rgb(255, 255, 255), 1, 16)
+	local pp = prompt(gateLock, "فتح البوابة", "القفل الأبيض", 1.2, function()
+		if State.stage ~= 7 then
+			return
+		end
+		State.stage = 8
+		tell("Sfx", "Unlock")
+		gateLock.Anchored = false
+		local nv = Instance.new("NumberValue")
+		nv.Value = 0
+		nv.Changed:Connect(function(v)
+			setGate(v)
+		end)
+		TweenService:Create(nv, TweenInfo.new(3, Enum.EasingStyle.Quad), { Value = 90 }):Play()
+		task.delay(2, function()
+			tell("Ending")
+		end)
+	end)
+	pp.Enabled = false
+	return pp
+end
+local gatePrompt
+
+local function finishWaveServer()
+	if State.stage ~= 6 then
+		return
+	end
+	State.stage = 7
+	redLights(false)
+	sub("أنا", "انتهوا... البوابة! المفتاح الأبيض يفتح القفل الأخير.", 4)
+	mission("افتح قفل البوابة بالمفتاح الأبيض", Vector3.new(200, 6, -1100))
+	if gatePrompt then
+		gatePrompt.Enabled = true
+	end
+end
+
+------------------------------------------------------------------
+-- الدلائل + صندوق السيارة
+------------------------------------------------------------------
+local function evidenceMission()
+	local c = (State.photos.car and 1 or 0) + (State.photos.body and 1 or 0)
+	local pos
+	if not State.photos.car then
+		pos = wreck.Body.Position
+	else
+		pos = bodyModel.Torso.Position
+	end
+	mission(("صوّر الدلائل بالجوال: سيارته + جثته (%d/2)"):format(c), pos)
+end
+
+local function handlePhoto(cf)
+	if typeof(cf) ~= "CFrame" or State.stage ~= 2 then
+		return
+	end
+	local char = mainPlayer.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp or (cf.Position - hrp.Position).Magnitude > 25 then
+		return
+	end
+	local function check(done, model, pos)
+		if done then
+			return false
+		end
+		local d = pos - cf.Position
+		if d.Magnitude > 60 or d.Magnitude < 1 then
+			return false
+		end
+		if d.Unit:Dot(cf.LookVector) < 0.88 then
+			return false
+		end
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.FilterDescendantsInstances = { char }
+		local r = workspace:Raycast(cf.Position, d, rp)
+		if r and not r.Instance:IsDescendantOf(model) then
+			return false
+		end
+		return true
+	end
+	local got = false
+	if check(State.photos.car, wreck, wreck.Body.Position) then
+		State.photos.car = true
+		got = true
+		sub("أنا", "صورت سيارة الشرطي.. محطمة تماماً!", 3)
+	elseif check(State.photos.body, bodyModel, bodyModel.Torso.Position) then
+		State.photos.body = true
+		got = true
+		sub("أنا", "هذي جثته... الله يرحمه. صورتها.", 3)
+	end
+	tell("PhotoResult", got)
+	if got then
+		if State.photos.car and State.photos.body then
+			State.stage = 3
+			task.delay(3.5, function()
+				sub("أنا", "الباب انقفل بالسلاسل.. لازم ألقى 6 مفاتيح وأفتح الأقفال.", 4)
+				task.delay(4, nextKeyStep)
+			end)
+			mission("تم تصوير الدلائل ✔", nil)
+		else
+			evidenceMission()
+		end
+	end
+end
+
+local parkedCar
+local PARK_CF = CFrame.new(200, 0.3, -1120)
+
+local function buildParkedCar()
+	parkedCar = Templates.PoliceCar:Clone()
+	placeCar(parkedCar, PARK_CF)
+	parkedCar.Parent = world
+	local trunk = parkedCar.Trunk
+	local gear = parkedCar.Gear
+	local base = trunk.CFrame
+	local pp
+	pp = prompt(trunk, "فتح الصندوق", "سيارة الشرطة", 0.8, function()
+		if State.stage ~= 1 then
+			return
+		end
+		State.stage = 2
+		pp:Destroy()
+		TweenService:Create(trunk, TweenInfo.new(0.9), { CFrame = base * CFrame.new(0, 0, -1.5) * CFrame.Angles(math.rad(-65), 0, 0) * CFrame.new(0, 0, 1.5) }):Play()
+		tell("Sfx", "Switch")
+		State.gear = true
+		giveGear()
+		gear.Transparency = 0
+		task.delay(1.5, function()
+			gear:Destroy()
+		end)
+		sub("أنا", "مسدس.. كشاف.. وجوال للتصوير. وأحس أن شيء يراقبني!", 4)
+		local spots = {}
+		for _, h in ipairs(roles.ritual) do
+			table.insert(spots, { center = h.center, dir = h.dir })
+		end
+		task.delay(3, function()
+			tell("Rituals", spots)
+			tell("Stalker", true)
+			tell("Halluc", true)
+			evidenceMission()
+		end)
+	end)
+end
+
+------------------------------------------------------------------
+-- نهاية المقدمة
+------------------------------------------------------------------
+local function onIntroDone()
+	if State.stage ~= 0 then
+		return
+	end
+	State.stage = 1
+	setGate(0)
+	buildParkedCar()
+	gatePrompt = buildGateLock()
+	spawnPlayer(SPAWN_CF)
+	mission("اذهب إلى صندوق السيارة وخذ المستلزمات", PARK_CF.Position + Vector3.new(0, 3, 7))
+	sub("أنا", "البوابة انقفلت!.. أحتاج أجهز نفسي أول.", 3.5)
+end
+
+------------------------------------------------------------------
+-- استقبال أحداث العميل
+------------------------------------------------------------------
+ToServer.OnServerEvent:Connect(function(plr, action, a)
+	if plr ~= mainPlayer then
+		return
+	end
+	if action == "ClientReady" then
+		if not State.introStarted then
+			State.introStarted = true
+			task.wait(1)
+			ToClient:FireClient(plr, "PlayIntro")
+		end
+	elseif action == "IntroDone" then
+		onIntroDone()
+	elseif action == "Photo" then
+		handlePhoto(a)
+	elseif action == "Code" then
+		if State.stage ~= 4 or State.noteCount < 4 or typeof(a) ~= "string" then
+			return
+		end
+		local right = table.concat(State.code, "")
+		if a == right then
+			tell("CodeResult", true)
+			openSafe()
+		else
+			tell("CodeResult", false)
+			tell("Sfx", "Scare")
+		end
+	elseif action == "Hurt" then
+		if State.stage >= 2 and typeof(a) == "number" then
+			local char = plr.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum and hum.Health > 0 then
+				hum:TakeDamage(math.clamp(a, 1, 35))
+			end
+		end
+	elseif action == "WaveDone" then
+		finishWaveServer()
+	end
+end)
+
+Players.PlayerAdded:Connect(function(plr)
+	if mainPlayer then
+		plr:Kick("هذي الماب للاعب واحد فقط - ادخل سيرفر خاص ثاني.")
+		return
+	end
+	mainPlayer = plr
+end)
+for _, p in ipairs(Players:GetPlayers()) do
+	if not mainPlayer then
+		mainPlayer = p
+	end
+end
+Players.PlayerRemoving:Connect(function(plr)
+	if plr == mainPlayer then
+		mainPlayer = nil
+	end
+end)
+]]></ProtectedString></Properties></Item></Item>
+<Item class="StarterPlayer" referent="RBX5"><Properties><string name="Name">StarterPlayer</string></Properties><Item class="StarterPlayerScripts" referent="RBX6"><Properties><string name="Name">StarterPlayerScripts</string></Properties><Item class="LocalScript" referent="RBX7"><Properties><string name="Name">HorrorMap_Client</string><ProtectedString name="Source"><![CDATA[--[[
+	========================================================
+	  حارة الأشباح  |  HorrorMap_Client
+	  نوع السكربت: LocalScript
+	  مكانه: StarterPlayer > StarterPlayerScripts
+	========================================================
+	الكاميرا السينمائية + الواجهة + الجن + المطارد + الهلوسة + التصوير
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local CollectionService = game:GetService("CollectionService")
+local SoundService = game:GetService("SoundService")
+local Debris = game:GetService("Debris")
+
+local plr = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+local ToClient = RS:WaitForChild("ToClient")
+local ToServer = RS:WaitForChild("ToServer")
+local world = workspace:WaitForChild("HorrorWorld")
+
+local function rgb(r, g, b)
+	return Color3.fromRGB(r, g, b)
+end
+
+------------------------------------------------------------------
+-- أدوات
+------------------------------------------------------------------
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	o.Parent = parent
+	return o
+end
+
+local function sfx(name, vol)
+	local id = RS:GetAttribute("Snd_" .. name)
+	if not id or id == "" then
+		return
+	end
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = vol or 0.8
+	s.Parent = SoundService
+	s:Play()
+	Debris:AddItem(s, 10)
+end
+
+local function getHum()
+	local c = plr.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function getHrp()
+	local c = plr.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function alive()
+	local h = getHum()
+	return h ~= nil and h.Health > 0
+end
+
+------------------------------------------------------------------
+-- الواجهة
+------------------------------------------------------------------
+local FONT = Enum.Font.GothamBold
+local gui = new("ScreenGui", { Name = "HorrorUI", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 10 }, plr:WaitForChild("PlayerGui"))
+
+local black = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0, BorderSizePixel = 0, ZIndex = 100 }, gui)
+local flashF = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 90 }, gui)
+local hurtF = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = rgb(150, 0, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 80 }, gui)
+
+local bigLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.8, 0.2),
+	BackgroundTransparency = 1, TextColor3 = rgb(255, 255, 255), Font = FONT, TextScaled = true, Text = "",
+	TextTransparency = 1, ZIndex = 101,
+}, gui)
+
+local subBox = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.93), Size = UDim2.fromScale(0.86, 0.2),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.4, Visible = false, ZIndex = 50, BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, subBox)
+local subWho = new("TextLabel", {
+	Size = UDim2.fromScale(0.96, 0.28), Position = UDim2.fromScale(0.02, 0.03), BackgroundTransparency = 1,
+	Font = FONT, TextScaled = true, TextColor3 = rgb(255, 200, 90), Text = "", ZIndex = 51,
+}, subBox)
+new("UITextSizeConstraint", { MaxTextSize = 18 }, subWho)
+local subTxt = new("TextLabel", {
+	Size = UDim2.fromScale(0.96, 0.62), Position = UDim2.fromScale(0.02, 0.34), BackgroundTransparency = 1,
+	Font = FONT, TextScaled = true, TextWrapped = true, TextColor3 = Color3.new(1, 1, 1), Text = "", ZIndex = 51,
+}, subBox)
+new("UITextSizeConstraint", { MaxTextSize = 22 }, subTxt)
+
+local missionLbl = new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.02), Size = UDim2.fromScale(0.7, 0.08),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.55, TextColor3 = rgb(255, 235, 170),
+	Font = FONT, TextScaled = true, Visible = false, ZIndex = 40, BorderSizePixel = 0, Text = "",
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, missionLbl)
+new("UITextSizeConstraint", { MaxTextSize = 20 }, missionLbl)
+
+local waveHud = new("TextLabel", {
+	AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(0.98, 0.12), Size = UDim2.fromScale(0.28, 0.07),
+	BackgroundColor3 = rgb(80, 0, 0), BackgroundTransparency = 0.4, TextColor3 = rgb(255, 120, 120),
+	Font = FONT, TextScaled = true, Visible = false, ZIndex = 40, BorderSizePixel = 0, Text = "",
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, waveHud)
+new("UITextSizeConstraint", { MaxTextSize = 20 }, waveHud)
+
+local codeHud = new("TextLabel", {
+	AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0.02, 0.7), Size = UDim2.fromScale(0.3, 0.07),
+	BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.45, TextColor3 = rgb(255, 255, 255),
+	Font = FONT, TextScaled = true, Visible = false, ZIndex = 40, BorderSizePixel = 0, Text = "",
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 8) }, codeHud)
+new("UITextSizeConstraint", { MaxTextSize = 20 }, codeHud)
+
+local cross = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(8, 8),
+	BackgroundColor3 = rgb(255, 60, 60), Visible = false, ZIndex = 30, BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, cross)
+
+local viewfinder = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.7, 0.7),
+	BackgroundTransparency = 1, Visible = false, ZIndex = 30,
+}, gui)
+new("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 3, Transparency = 0.2 }, viewfinder)
+new("TextLabel", {
+	Position = UDim2.fromScale(0.03, 0.03), Size = UDim2.fromScale(0.2, 0.08), BackgroundTransparency = 1,
+	Text = "● REC", TextColor3 = rgb(255, 40, 40), Font = FONT, TextScaled = true, ZIndex = 31,
+}, viewfinder)
+new("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.97), Size = UDim2.fromScale(0.6, 0.08),
+	BackgroundTransparency = 1, Text = "وجّه نحو الدليل واضغط للتصوير", TextColor3 = Color3.new(1, 1, 1),
+	Font = FONT, TextScaled = true, ZIndex = 31,
+}, viewfinder)
+
+-- لوحة الأرقام
+local kp = new("Frame", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.34, 0.8),
+	BackgroundColor3 = rgb(20, 20, 24), Visible = false, ZIndex = 60, BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 12) }, kp)
+new("UIStroke", { Color = rgb(200, 40, 40), Thickness = 2 }, kp)
+local kpDisp = new("TextLabel", {
+	Position = UDim2.fromScale(0.08, 0.04), Size = UDim2.fromScale(0.84, 0.14), BackgroundColor3 = Color3.new(0, 0, 0),
+	TextColor3 = rgb(80, 255, 120), Font = Enum.Font.Code, TextScaled = true, Text = "____", ZIndex = 61, BorderSizePixel = 0,
+}, kp)
+local kpGrid = new("Frame", {
+	Position = UDim2.fromScale(0.05, 0.21), Size = UDim2.fromScale(0.9, 0.77), BackgroundTransparency = 1, ZIndex = 61,
+}, kp)
+new("UIGridLayout", { CellSize = UDim2.fromScale(0.31, 0.23), CellPadding = UDim2.fromScale(0.02, 0.02), SortOrder = Enum.SortOrder.LayoutOrder }, kpGrid)
+local entry = ""
+local function kpShow()
+	kpDisp.Text = entry .. string.rep("_", 4 - #entry)
+end
+for i, label in ipairs({ "1", "2", "3", "4", "5", "6", "7", "8", "9", "X", "0", "OK" }) do
+	local b = new("TextButton", {
+		Text = label, Font = FONT, TextScaled = true, TextColor3 = Color3.new(1, 1, 1),
+		BackgroundColor3 = (label == "OK") and rgb(30, 120, 50) or ((label == "X") and rgb(120, 30, 30) or rgb(50, 50, 58)),
+		LayoutOrder = i, ZIndex = 62, BorderSizePixel = 0,
+	}, kpGrid)
+	new("UICorner", { CornerRadius = UDim.new(0, 8) }, b)
+	b.MouseButton1Click:Connect(function()
+		if label == "X" then
+			if #entry > 0 then
+				entry = entry:sub(1, -2)
+			else
+				kp.Visible = false
+			end
+		elseif label == "OK" then
+			if #entry == 4 then
+				ToServer:FireServer("Code", entry)
+				entry = ""
+			end
+		elseif #entry < 4 then
+			entry = entry .. label
+		end
+		kpShow()
+	end)
+end
+
+------------------------------------------------------------------
+-- تأثيرات الشاشة
+------------------------------------------------------------------
+local function fade(target, t)
+	TweenService:Create(black, TweenInfo.new(t), { BackgroundTransparency = target }):Play()
+end
+
+local function flash(color, alpha, t)
+	flashF.BackgroundColor3 = color
+	flashF.BackgroundTransparency = alpha
+	TweenService:Create(flashF, TweenInfo.new(t), { BackgroundTransparency = 1 }):Play()
+end
+
+local shake = 0
+local function doShake(a)
+	shake = math.max(shake, a)
+end
+
+local function hurtFx()
+	hurtF.BackgroundTransparency = 0.45
+	TweenService:Create(hurtF, TweenInfo.new(0.5), { BackgroundTransparency = 1 }):Play()
+	doShake(0.5)
+end
+
+local function title(text, dur)
+	bigLbl.Text = text
+	TweenService:Create(bigLbl, TweenInfo.new(0.8), { TextTransparency = 0 }):Play()
+	task.wait(dur)
+	TweenService:Create(bigLbl, TweenInfo.new(0.8), { TextTransparency = 1 }):Play()
+	task.wait(0.8)
+end
+
+local subToken = 0
+local function say(who, text, hold)
+	subToken += 1
+	local my = subToken
+	subBox.Visible = true
+	subWho.Text = who or ""
+	subTxt.Text = text
+	subTxt.MaxVisibleGraphemes = 0
+	local n = utf8.len(text) or #text
+	for i = 1, n do
+		if my ~= subToken then
+			return
+		end
+		subTxt.MaxVisibleGraphemes = i
+		task.wait(0.03)
+	end
+	subTxt.MaxVisibleGraphemes = -1
+	task.wait(hold or 2)
+	if my == subToken then
+		subBox.Visible = false
+	end
+end
+
+local function scare()
+	black.BackgroundTransparency = 0
+	task.delay(0.07, function()
+		flash(rgb(200, 0, 0), 0.2, 0.6)
+		black.BackgroundTransparency = 1
+	end)
+	doShake(1.4)
+	sfx("Scare", 1)
+	cam.FieldOfView = 45
+	TweenService:Create(cam, TweenInfo.new(0.6), { FieldOfView = 70 }):Play()
+end
+
+local function hurt(n)
+	ToServer:FireServer("Hurt", n)
+	hurtFx()
+end
+
+------------------------------------------------------------------
+-- نظام الكاميرا (للمشاهد السينمائية + اهتزاز)
+------------------------------------------------------------------
+local camFn = nil
+RunService:BindToRenderStep("HorrorCam", Enum.RenderPriority.Camera.Value + 1, function()
+	if camFn then
+		camFn()
+	end
+	if shake > 0.005 then
+		if cam.CameraType == Enum.CameraType.Scriptable then
+			cam.CFrame = cam.CFrame * CFrame.new((math.random() - 0.5) * shake, (math.random() - 0.5) * shake, 0) * CFrame.Angles(0, 0, (math.random() - 0.5) * shake * 0.04)
+		else
+			local h = getHum()
+			if h then
+				h.CameraOffset = Vector3.new((math.random() - 0.5) * shake, (math.random() - 0.5) * shake, 0)
+			end
+		end
+		shake *= 0.92
+	elseif cam.CameraType ~= Enum.CameraType.Scriptable then
+		local h = getHum()
+		if h and h.CameraOffset ~= Vector3.zero then
+			h.CameraOffset = Vector3.zero
+		end
+	end
+end)
+
+local function camMove(a, b, dur, fovA, fovB)
+	local t0 = os.clock()
+	camFn = function()
+		local k = math.clamp((os.clock() - t0) / dur, 0, 1)
+		k = k * k * (3 - 2 * k)
+		cam.CFrame = a:Lerp(b, k)
+		if fovA then
+			cam.FieldOfView = fovA + (fovB - fovA) * k
+		end
+	end
+end
+
+------------------------------------------------------------------
+-- المقدمة السينمائية
+------------------------------------------------------------------
+local function placeCar(car, cf)
+	car:PivotTo(cf * CFrame.new(0, 2, 0))
+end
+
+local HL = CFrame.new(188, 7, -1100)
+local HR = CFrame.new(212, 7, -1100)
+local function setGateLocal(deg)
+	local a = math.rad(deg)
+	local gl, gr = world:FindFirstChild("GateL"), world:FindFirstChild("GateR")
+	if gl then
+		gl:PivotTo(HL * CFrame.Angles(0, a, 0) * CFrame.new(6, 0, 0))
+	end
+	if gr then
+		gr:PivotTo(HR * CFrame.Angles(0, -a, 0) * CFrame.new(-6, 0, 0))
+	end
+end
+
+local function dist(t)
+	local tc = 13.68
+	if t < 2 then
+		return 0.5 * 35 * t * t
+	elseif t < 2 + tc then
+		return 70 + 70 * (t - 2)
+	else
+		local td = math.min(t - 2 - tc, 3.5)
+		return 70 + 70 * tc + 70 * td - 10 * td * td
+	end
+end
+
+local function runDrive()
+	local tpl = RS:WaitForChild("Templates"):WaitForChild("PoliceCar")
+	local car = tpl:Clone()
+	car.Parent = workspace
+	local startZ = 30
+	placeCar(car, CFrame.new(200, 0.3, startZ))
+	local pv = car:GetPivot()
+	local wheels = {}
+	for _, w in ipairs(car:GetChildren()) do
+		if w.Name:sub(1, 5) == "Wheel" then
+			table.insert(wheels, { part = w, off = pv:ToObjectSpace(w.CFrame) })
+		end
+	end
+	local T = 19.18
+	local static2
+	local t0 = os.clock()
+	camFn = function()
+		local t = os.clock() - t0
+		local d = dist(t)
+		local cf = CFrame.new(200, 0.3, startZ - d) * CFrame.Angles(0, 0, math.sin(t * 3) * 0.012)
+		placeCar(car, cf)
+		local pvn = car:GetPivot()
+		for _, w in ipairs(wheels) do
+			w.part.CFrame = pvn * w.off * CFrame.Angles(-d / 1.2, 0, 0)
+		end
+		local cp = cf.Position + Vector3.new(0, 2, 0)
+		if t < 4.5 then
+			cam.CFrame = CFrame.lookAt((cf * CFrame.new(7, 4.5, 17 + t * 0.5)).Position, cp)
+			cam.FieldOfView = 65
+		elseif t < 8.5 then
+			static2 = static2 or Vector3.new(214, 3, cf.Position.Z - 180)
+			cam.CFrame = CFrame.lookAt(static2, cp)
+			cam.FieldOfView = 55
+		elseif t < 11.5 then
+			cam.CFrame = CFrame.lookAt((cf * CFrame.new(-9, 1.6, -4 + (t - 8.5))).Position, cp)
+			cam.FieldOfView = 70
+		elseif t < 14 then
+			cam.CFrame = CFrame.lookAt((cf * CFrame.new(0, 38, 10)).Position, cp)
+			cam.FieldOfView = 70
+		else
+			cam.CFrame = CFrame.lookAt(Vector3.new(206, 3.2, -1165), cp)
+			cam.FieldOfView = 65
+		end
+	end
+	task.wait(T + 0.3)
+	return car
+end
+
+local function playIntro()
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false)
+	end)
+	cam.CameraType = Enum.CameraType.Scriptable
+	local OFF = Vector3.new(0, 500, 0)
+	local office = world:WaitForChild("Office")
+	local mgr = office:WaitForChild("Manager")
+	local mHead, mRArm = mgr:WaitForChild("Head"), mgr:WaitForChild("RArm")
+	local h0, a0 = mHead.CFrame, mRArm.CFrame
+	local talking = true
+	local mConn = RunService.RenderStepped:Connect(function()
+		if talking then
+			local t = os.clock()
+			mHead.CFrame = h0 * CFrame.Angles(math.sin(t * 3) * 0.06, math.sin(t * 1.7) * 0.12, 0)
+			mRArm.CFrame = a0 * CFrame.new(0, 1, 0) * CFrame.Angles(math.sin(t * 2.4) * 0.5 + 0.3, 0, 0) * CFrame.new(0, -1, 0)
+		end
+	end)
+	local c0 = CFrame.lookAt(OFF + Vector3.new(7, 4.2, 9), OFF + Vector3.new(0, 4.3, -9))
+	local c1 = CFrame.lookAt(OFF + Vector3.new(2.5, 4.4, 2), OFF + Vector3.new(0, 4.6, -9))
+	camMove(c0, c1, 24, 60, 50)
+	task.wait(0.5)
+	fade(1, 2.5)
+	task.wait(2)
+	say("المدير", "شوف.. في شرطي له يومين مختفي ومنقطع اتصاله، بعد ما أرسلناه للحارة المسكونة بعملية فحص.", 1.2)
+	say("المدير", "والحكومة فخورة بك.. أنت روح وشوف وش الوضع هناك.", 1.5)
+	say("أنت", "تمام أمرك سيدي، بروح الحين.", 1.5)
+	talking = false
+	fade(0, 3.2)
+	task.wait(3.4)
+	mConn:Disconnect()
+	camFn = nil
+	title("هذا أنا.. وفي طريقي إلى الحارة المسكونة", 2.5)
+	-- الطريق السريع
+	cam.FieldOfView = 65
+	fade(1, 2)
+	local car = runDrive()
+	-- الكاميرا للبوابة
+	camMove(cam.CFrame, CFrame.lookAt(Vector3.new(204, 4.5, -1146), Vector3.new(200, 9, -1100)), 2.2, 65, 60)
+	task.wait(1.6)
+	local gt0 = os.clock()
+	while true do
+		local a = math.clamp((os.clock() - gt0) / 1.3, 0, 1)
+		setGateLocal(90 * (1 - a * a))
+		if a >= 1 then
+			break
+		end
+		task.wait()
+	end
+	setGateLocal(0)
+	doShake(1.5)
+	sfx("Slam", 1)
+	task.wait(2)
+	fade(0, 1.5)
+	task.wait(1.7)
+	camFn = nil
+	car:Destroy()
+	ToServer:FireServer("IntroDone")
+	local char = plr.Character or plr.CharacterAdded:Wait()
+	char:WaitForChild("HumanoidRootPart")
+	local hum = char:WaitForChild("Humanoid")
+	cam.CameraType = Enum.CameraType.Custom
+	cam.CameraSubject = hum
+	cam.FieldOfView = 70
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+	end)
+	fade(1, 2.5)
+end
+
+------------------------------------------------------------------
+-- المهام
+------------------------------------------------------------------
+local mText, mTarget = "", nil
+local function setMission(text, pos)
+	mText, mTarget = text or "", pos
+	missionLbl.Visible = (text ~= nil and text ~= "")
+	missionLbl.Text = mText
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.3)
+		if missionLbl.Visible then
+			local hrp = getHrp()
+			if mTarget and hrp then
+				missionLbl.Text = mText .. "  •  " .. math.floor((hrp.Position - mTarget).Magnitude) .. " م"
+			else
+				missionLbl.Text = mText
+			end
+		end
+	end
+end)
+
+-- دوران المفاتيح
+RunService.RenderStepped:Connect(function()
+	local t = os.clock()
+	for _, m in ipairs(CollectionService:GetTagged("Spin")) do
+		local base = m:GetAttribute("Base")
+		if base then
+			m:PivotTo(base * CFrame.Angles(0, t * 1.6, 0) + Vector3.new(0, math.sin(t * 2) * 0.25, 0))
+		end
+	end
+end)
+
+------------------------------------------------------------------
+-- الجن (30)
+------------------------------------------------------------------
+local ghosts = {}
+local kills, TOTAL = 0, 30
+local waveActive = false
+
+local function ghostCount()
+	local n = 0
+	for _ in pairs(ghosts) do
+		n += 1
+	end
+	return n
+end
+
+local function updateWaveHud()
+	waveHud.Text = "الجن المتبقي: " .. (TOTAL - kills)
+end
+
+local function makeGhost()
+	local m = Instance.new("Model")
+	m.Name = "Ghost"
+	local function pt(name, size, off, color, mat, transp, shape)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.Color = color
+		p.Material = mat or Enum.Material.SmoothPlastic
+		p.Transparency = transp or 0
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanTouch = false
+		if shape then
+			p.Shape = shape
+		end
+		p.CFrame = CFrame.new(off)
+		p.Parent = m
+		return p
+	end
+	local root = pt("Root", Vector3.new(2, 2, 2), Vector3.new(0, 0, 0), rgb(255, 255, 255), nil, 1)
+	root.CanQuery = false
+	pt("Head", Vector3.new(2.6, 2.6, 2.6), Vector3.new(0, 3.2, 0), rgb(210, 220, 230), Enum.Material.SmoothPlastic, 0.15, Enum.PartType.Ball)
+	pt("EyeL", Vector3.new(0.5, 0.7, 0.2), Vector3.new(-0.6, 3.4, -1.2), rgb(255, 20, 20), Enum.Material.Neon)
+	pt("EyeR", Vector3.new(0.5, 0.7, 0.2), Vector3.new(0.6, 3.4, -1.2), rgb(255, 20, 20), Enum.Material.Neon)
+	pt("Mouth", Vector3.new(1, 1.2, 0.2), Vector3.new(0, 2.5, -1.25), rgb(10, 0, 0))
+	pt("Cloak1", Vector3.new(3, 2.5, 2), Vector3.new(0, 1.4, 0), rgb(160, 180, 200), Enum.Material.SmoothPlastic, 0.3)
+	pt("Cloak2", Vector3.new(2.2, 2, 1.6), Vector3.new(0, -0.4, 0), rgb(160, 180, 200), Enum.Material.SmoothPlastic, 0.4)
+	pt("Cloak3", Vector3.new(1.2, 1.8, 1), Vector3.new(0, -2, 0), rgb(160, 180, 200), Enum.Material.SmoothPlastic, 0.55)
+	pt("ArmL", Vector3.new(0.6, 0.6, 3.2), Vector3.new(-1.8, 1.6, -1.5), rgb(220, 230, 240), Enum.Material.SmoothPlastic, 0.2)
+	pt("ArmR", Vector3.new(0.6, 0.6, 3.2), Vector3.new(1.8, 1.6, -1.5), rgb(220, 230, 240), Enum.Material.SmoothPlastic, 0.2)
+	local hit = pt("Hit", Vector3.new(3.8, 8, 3.8), Vector3.new(0, 1, 0), rgb(255, 255, 255), nil, 1)
+	hit.CanQuery = true
+	new("PointLight", { Color = rgb(255, 40, 40), Brightness = 1.4, Range = 14 }, root)
+	local pe = new("ParticleEmitter", {
+		Texture = "rbxasset://textures/particles/smoke_main.dds", Color = ColorSequence.new(rgb(90, 90, 100)),
+		Size = NumberSequence.new(1.5, 3), Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1) }),
+		Lifetime = NumberRange.new(1, 2), Rate = 14, Speed = NumberRange.new(1, 2), EmissionDirection = Enum.NormalId.Bottom,
+	}, root)
+	pe.Enabled = true
+	m.PrimaryPart = root
+	return m
+end
+
+local function spawnGhost()
+	local hrp = getHrp()
+	if not hrp then
+		return
+	end
+	local ang = math.random() * math.pi * 2
+	local d = 40 + math.random() * 25
+	local p = hrp.Position + Vector3.new(math.cos(ang) * d, 0, math.sin(ang) * d)
+	p = Vector3.new(math.clamp(p.X, 62, 338), 4, math.clamp(p.Z, -1488, -1112))
+	local m = makeGhost()
+	m:PivotTo(CFrame.new(p))
+	m.Parent = workspace
+	for _, part in ipairs(m:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name ~= "Root" and part.Name ~= "Hit" then
+			local tr = part.Transparency
+			part.Transparency = 1
+			TweenService:Create(part, TweenInfo.new(1.2), { Transparency = tr }):Play()
+		end
+	end
+	ghosts[m] = { hp = 2, speed = 9 + math.random() * 3.5, lastAtk = 0, born = os.clock() }
+	sfx("Ghost", 0.7)
+end
+
+local function burst(pos)
+	for _ = 1, 10 do
+		local p = Instance.new("Part")
+		p.Size = Vector3.new(0.5, 0.5, 0.5)
+		p.Shape = Enum.PartType.Ball
+		p.Material = Enum.Material.Neon
+		p.Color = rgb(255, 60, 60)
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.Position = pos
+		p.Parent = workspace
+		local dir = Vector3.new(math.random() - 0.5, math.random() - 0.2, math.random() - 0.5).Unit * (4 + math.random() * 5)
+		TweenService:Create(p, TweenInfo.new(0.5), { Position = pos + dir, Transparency = 1, Size = Vector3.new(0.1, 0.1, 0.1) }):Play()
+		Debris:AddItem(p, 0.6)
+	end
+end
+
+local function clearGhosts()
+	for m in pairs(ghosts) do
+		m:Destroy()
+		ghosts[m] = nil
+	end
+end
+
+local stalkerOn, hallucOn = false, false
+local st, stNext = nil, 0
+local busy = false
+
+local function destroyStalker()
+	if st then
+		st:Destroy()
+		st = nil
+	end
+end
+
+local function finishWave()
+	waveActive = false
+	clearGhosts()
+	waveHud.Visible = false
+	ToServer:FireServer("WaveDone")
+end
+
+local function hitGhost(m)
+	local g = ghosts[m]
+	if not g then
+		return
+	end
+	g.hp -= 1
+	sfx("Ghost", 0.4)
+	if g.hp <= 0 then
+		ghosts[m] = nil
+		burst(m:GetPivot().Position)
+		for _, part in ipairs(m:GetDescendants()) do
+			if part:IsA("BasePart") then
+				TweenService:Create(part, TweenInfo.new(0.35), { Transparency = 1 }):Play()
+			end
+		end
+		Debris:AddItem(m, 0.5)
+		kills += 1
+		updateWaveHud()
+		flash(rgb(255, 255, 255), 0.85, 0.2)
+		if kills >= TOTAL then
+			finishWave()
+		end
+	end
+end
+
+local function startWave(total)
+	TOTAL = total or 30
+	kills = 0
+	waveActive = true
+	stalkerOn, hallucOn = false, false
+	destroyStalker()
+	waveHud.Visible = true
+	updateWaveHud()
+	task.spawn(function()
+		local t0 = os.clock()
+		while waveActive do
+			if alive() then
+				local maxAlive = math.clamp(1 + math.floor((os.clock() - t0) / 12), 1, 6)
+				local remaining = TOTAL - kills
+				local n = ghostCount()
+				if n < maxAlive and n < remaining then
+					spawnGhost()
+				end
+			end
+			task.wait(2.5 + math.random() * 1.5)
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- المطارد (يتحرك لما ما تشوفه)
+------------------------------------------------------------------
+local function makeStalker()
+	local m = Instance.new("Model")
+	m.Name = "Watcher"
+	local function p(name, size, off, color, mat)
+		local x = Instance.new("Part")
+		x.Name = name
+		x.Size = size
+		x.Color = color
+		x.Material = mat or Enum.Material.SmoothPlastic
+		x.Anchored = true
+		x.CanCollide = false
+		x.CanQuery = false
+		x.CanTouch = false
+		x.CFrame = CFrame.new(off)
+		x.Parent = m
+		return x
+	end
+	local dark = rgb(8, 8, 10)
+	local torso = p("Torso", Vector3.new(2.2, 3.4, 1.2), Vector3.new(0, 5.6, 0), dark)
+	p("Head", Vector3.new(1.5, 1.7, 1.5), Vector3.new(0, 8.1, 0), dark)
+	p("EyeL", Vector3.new(0.35, 0.2, 0.1), Vector3.new(-0.35, 8.2, -0.78), Color3.new(1, 1, 1), Enum.Material.Neon)
+	p("EyeR", Vector3.new(0.35, 0.2, 0.1), Vector3.new(0.35, 8.2, -0.78), Color3.new(1, 1, 1), Enum.Material.Neon)
+	p("ArmL", Vector3.new(0.6, 5, 0.6), Vector3.new(-1.6, 5.2, 0), dark)
+	p("ArmR", Vector3.new(0.6, 5, 0.6), Vector3.new(1.6, 5.2, 0), dark)
+	p("LegL", Vector3.new(0.9, 4, 0.9), Vector3.new(-0.6, 2, 0), dark)
+	p("LegR", Vector3.new(0.9, 4, 0.9), Vector3.new(0.6, 2, 0), dark)
+	m.PrimaryPart = torso
+	return m
+end
+
+local function updateStalker(dt)
+	if not stalkerOn then
+		destroyStalker()
+		return
+	end
+	local hrp = getHrp()
+	if busy or not hrp or not alive() then
+		return
+	end
+	local now = os.clock()
+	if not st then
+		if now < stNext then
+			return
+		end
+		local ang = math.random() * math.pi * 2
+		local d = 70 + math.random() * 20
+		local p = hrp.Position + Vector3.new(math.cos(ang) * d, 0, math.sin(ang) * d)
+		p = Vector3.new(math.clamp(p.X, 60, 340), 6, math.clamp(p.Z, -1490, -1115))
+		st = makeStalker()
+		st:PivotTo(CFrame.new(p))
+		st.Parent = workspace
+		return
+	end
+	local pos = st:GetPivot().Position
+	local flat = Vector3.new(hrp.Position.X - pos.X, 0, hrp.Position.Z - pos.Z)
+	local d = flat.Magnitude
+	local toSt = pos - cam.CFrame.Position
+	local seen = toSt.Magnitude < 130 and toSt.Unit:Dot(cam.CFrame.LookVector) > 0.55
+	if d < 6.5 then
+		scare()
+		hurt(30)
+		destroyStalker()
+		stNext = now + 25 + math.random() * 15
+		return
+	end
+	if not seen and d > 4 then
+		pos = pos + flat.Unit * 8 * dt
+	end
+	st:PivotTo(CFrame.lookAt(Vector3.new(pos.X, 6, pos.Z), Vector3.new(hrp.Position.X, 6, hrp.Position.Z)))
+	if seen and d < 40 then
+		doShake(0.05)
+	end
+end
+
+------------------------------------------------------------------
+-- حلقة الجن + المطارد
+------------------------------------------------------------------
+RunService.Heartbeat:Connect(function(dt)
+	local hrp = getHrp()
+	if hrp and alive() then
+		for m, g in pairs(ghosts) do
+			local pos = m:GetPivot().Position
+			local target = hrp.Position
+			local flat = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
+			local d = flat.Magnitude
+			local age = os.clock() - g.born
+			local spd = age < 1.2 and 0 or g.speed
+			if d > 3.5 then
+				pos = pos + flat.Unit * math.min(spd * dt, d)
+			end
+			local y = 4 + math.sin(os.clock() * 2 + g.born) * 0.6
+			m:PivotTo(CFrame.lookAt(Vector3.new(pos.X, y, pos.Z), Vector3.new(target.X, y, target.Z)) * CFrame.Angles(math.rad(8), 0, math.sin(os.clock() * 3 + g.born) * 0.1))
+			if d < 5.5 and age > 1.2 and os.clock() - g.lastAtk > 1.4 then
+				g.lastAtk = os.clock()
+				hurt(10)
+			end
+		end
+	end
+	updateStalker(dt)
+end)
+
+------------------------------------------------------------------
+-- الهلوسة العشوائية + طقوس السحر
+------------------------------------------------------------------
+local whispers = { "...وراك", "...ارجع", "...ما راح تطلع", "...شفتك", "...تعال" }
+
+local function figureFlash()
+	local f = makeStalker()
+	local base = cam.CFrame * CFrame.new(0, 0, -20)
+	f:PivotTo(CFrame.lookAt(Vector3.new(base.Position.X, 6, base.Position.Z), Vector3.new(cam.CFrame.Position.X, 6, cam.CFrame.Position.Z)))
+	f.Parent = workspace
+	doShake(0.3)
+	flash(rgb(120, 0, 0), 0.8, 0.4)
+	sfx("Scare", 0.5)
+	task.wait(0.35)
+	f:Destroy()
+end
+
+local function whisperFx()
+	task.spawn(say, "؟؟؟", whispers[math.random(#whispers)], 0.6)
+	sfx("Whisper", 0.8)
+	doShake(0.2)
+end
+
+local function glitch()
+	for _ = 1, 3 do
+		black.BackgroundTransparency = 0
+		task.wait(0.06)
+		black.BackgroundTransparency = 1
+		task.wait(0.12)
+	end
+	flash(rgb(255, 0, 0), 0.85, 0.5)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(30 + math.random() * 30)
+		if hallucOn and not busy and alive() and not waveActive then
+			local k = math.random(3)
+			if k == 1 then
+				figureFlash()
+			elseif k == 2 then
+				whisperFx()
+			else
+				glitch()
+			end
+		end
+	end
+end)
+
+local function makeRobe()
+	local m = Instance.new("Model")
+	m.Name = "RobedFigure"
+	local function p(name, size, off, color, mat)
+		local x = Instance.new("Part")
+		x.Name = name
+		x.Size = size
+		x.Color = color
+		x.Material = mat or Enum.Material.Fabric
+		x.Anchored = true
+		x.CanCollide = false
+		x.CanQuery = false
+		x.CFrame = CFrame.new(off)
+		x.Parent = m
+		return x
+	end
+	local robe = p("Robe", Vector3.new(2.6, 4.6, 1.8), Vector3.new(0, 0, 0), rgb(18, 10, 10))
+	p("Hood", Vector3.new(1.7, 1.7, 1.7), Vector3.new(0, 3.1, 0), rgb(12, 6, 6))
+	p("EyeL", Vector3.new(0.3, 0.2, 0.1), Vector3.new(-0.35, 3.15, -0.88), rgb(255, 30, 30), Enum.Material.Neon)
+	p("EyeR", Vector3.new(0.3, 0.2, 0.1), Vector3.new(0.35, 3.15, -0.88), rgb(255, 30, 30), Enum.Material.Neon)
+	m.PrimaryPart = robe
+	return m
+end
+
+local ritualSpots = {}
+local ritualDone = {}
+
+local function runRitual(spot)
+	local hum, hrp = getHum(), getHrp()
+	if not hum or not hrp then
+		return
+	end
+	busy = true
+	ToServer:FireServer("Busy", true)
+	local oldSpeed = hum.WalkSpeed
+	hum.WalkSpeed = 0
+	hum.JumpHeight = 0
+	local folder = Instance.new("Folder")
+	folder.Name = "RitualHallucination"
+	folder.Parent = workspace
+	local c = spot.center
+	local ring = new("Part", {
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.15, 14, 14), Anchored = true, CanCollide = false, CanQuery = false,
+		Material = Enum.Material.Neon, Color = rgb(200, 0, 0), Transparency = 0.35,
+		CFrame = CFrame.new(c + Vector3.new(0, 0.55, 0)) * CFrame.Angles(0, 0, math.rad(90)),
+	}, folder)
+	local ring2 = new("Part", {
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.2, 10, 10), Anchored = true, CanCollide = false, CanQuery = false,
+		Material = Enum.Material.SmoothPlastic, Color = rgb(10, 0, 0),
+		CFrame = CFrame.new(c + Vector3.new(0, 0.6, 0)) * CFrame.Angles(0, 0, math.rad(90)),
+	}, folder)
+	for i = 1, 8 do
+		local a = i / 8 * math.pi * 2
+		local cd = new("Part", {
+			Size = Vector3.new(0.4, 1.2, 0.4), Anchored = true, CanCollide = false, CanQuery = false, Material = Enum.Material.Neon,
+			Color = rgb(255, 170, 60), Position = c + Vector3.new(math.cos(a) * 7.4, 1, math.sin(a) * 7.4),
+		}, folder)
+		new("PointLight", { Color = rgb(255, 80, 40), Brightness = 1.2, Range = 10 }, cd)
+	end
+	local figs = {}
+	for i = 1, 6 do
+		local f = makeRobe()
+		f.Parent = folder
+		figs[i] = f
+	end
+	flash(rgb(255, 255, 255), 0.6, 0.5)
+	sfx("Whisper", 1)
+	doShake(0.4)
+	task.spawn(say, "؟؟؟", "...انت هنا.. أخيراً.. انت هنا...", 3)
+	local t0 = os.clock()
+	local function place(angleOffset)
+		for i, f in ipairs(figs) do
+			local a = angleOffset + i / 6 * math.pi * 2
+			local p = c + Vector3.new(math.cos(a) * 6.2, 2.9, math.sin(a) * 6.2)
+			f:PivotTo(CFrame.lookAt(p, Vector3.new(c.X, p.Y, c.Z)))
+		end
+	end
+	while os.clock() - t0 < 5.5 do
+		place((os.clock() - t0) * 0.9)
+		RunService.RenderStepped:Wait()
+	end
+	-- يلتفتون عليك كلهم
+	local hp = getHrp()
+	if hp then
+		for _, f in ipairs(figs) do
+			local pv = f:GetPivot().Position
+			f:PivotTo(CFrame.lookAt(pv, Vector3.new(hp.Position.X, pv.Y, hp.Position.Z)))
+		end
+	end
+	flash(rgb(255, 0, 0), 0.4, 0.8)
+	doShake(1)
+	sfx("Scare", 1)
+	task.wait(1.4)
+	black.BackgroundTransparency = 0.0
+	task.wait(0.3)
+	hum = getHum()
+	hp = getHrp()
+	if hum and hp then
+		hum.PlatformStand = true
+		hp.CFrame = hp.CFrame * CFrame.Angles(math.rad(90), 0, 0)
+	end
+	folder:Destroy()
+	task.wait(3.5)
+	if hum and hp then
+		local pos = hp.Position + Vector3.new(0, 3, 0)
+		local look = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+		if look.Magnitude < 0.1 then
+			look = Vector3.new(0, 0, -1)
+		end
+		hp.CFrame = CFrame.lookAt(pos, pos + look.Unit)
+		hum.PlatformStand = false
+		hum.WalkSpeed = oldSpeed
+		hum.JumpHeight = 7.2
+		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+	fade(1, 2.5)
+	busy = false
+	ToServer:FireServer("Busy", false)
+	say("أنا", "...وين راحوا؟ كأني كنت أحلم.. لازم أكمل!", 3)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		if hallucOn and not busy and alive() and not waveActive then
+			local hrp = getHrp()
+			if hrp then
+				for i, spot in ipairs(ritualSpots) do
+					if not ritualDone[i] and (hrp.Position - spot.center).Magnitude < 11 then
+						ritualDone[i] = true
+						runRitual(spot)
+						break
+					end
+				end
+			end
+		end
+	end
+end)
+
+------------------------------------------------------------------
+-- الأدوات: مسدس + جوال
+------------------------------------------------------------------
+local lastShot = 0
+local function shoot(tool)
+	if os.clock() - lastShot < 0.33 or not alive() then
+		return
+	end
+	lastShot = os.clock()
+	local vp = cam.ViewportSize
+	local ray = cam:ViewportPointToRay(vp.X / 2, vp.Y / 2)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { plr.Character }
+	local res = workspace:Raycast(ray.Origin, ray.Direction * 400, rp)
+	local hitPos = res and res.Position or (ray.Origin + ray.Direction * 400)
+	local handle = tool:FindFirstChild("Handle")
+	local from = handle and handle.Position or ray.Origin
+	local len = (hitPos - from).Magnitude
+	local tr = Instance.new("Part")
+	tr.Anchored = true
+	tr.CanCollide = false
+	tr.CanQuery = false
+	tr.Material = Enum.Material.Neon
+	tr.Color = rgb(255, 230, 120)
+	tr.Size = Vector3.new(0.12, 0.12, len)
+	tr.CFrame = CFrame.lookAt(from, hitPos) * CFrame.new(0, 0, -len / 2)
+	tr.Parent = workspace
+	Debris:AddItem(tr, 0.06)
+	if handle then
+		local fl = new("PointLight", { Color = rgb(255, 200, 100), Brightness = 4, Range = 14 }, handle)
+		Debris:AddItem(fl, 0.05)
+	end
+	sfx("Gun", 0.9)
+	doShake(0.25)
+	if res then
+		local model = res.Instance:FindFirstAncestorWhichIsA("Model")
+		if model and ghosts[model] then
+			hitGhost(model)
+		end
+	end
+end
+
+local lastPhoto = 0
+local function takePhoto()
+	if os.clock() - lastPhoto < 1.2 or not alive() then
+		return
+	end
+	lastPhoto = os.clock()
+	flash(Color3.new(1, 1, 1), 0, 0.4)
+	sfx("Shutter", 1)
+	ToServer:FireServer("Photo", cam.CFrame)
+end
+
+local function bindTool(tool)
+	if tool:GetAttribute("Bound") or not tool:IsA("Tool") then
+		return
+	end
+	tool:SetAttribute("Bound", true)
+	if tool.Name == "Pistol" then
+		tool.Equipped:Connect(function()
+			cross.Visible = true
+		end)
+		tool.Unequipped:Connect(function()
+			cross.Visible = false
+		end)
+		tool.Activated:Connect(function()
+			shoot(tool)
+		end)
+	elseif tool.Name == "Phone" then
+		tool.Equipped:Connect(function()
+			viewfinder.Visible = true
+		end)
+		tool.Unequipped:Connect(function()
+			viewfinder.Visible = false
+		end)
+		tool.Activated:Connect(takePhoto)
+	end
+end
+
+local function watchBackpack(bp)
+	for _, t in ipairs(bp:GetChildren()) do
+		bindTool(t)
+	end
+	bp.ChildAdded:Connect(bindTool)
+end
+
+local function onCharacter(char)
+	cross.Visible = false
+	viewfinder.Visible = false
+	char.ChildAdded:Connect(bindTool)
+	local bp = plr:WaitForChild("Backpack", 10)
+	if bp then
+		watchBackpack(bp)
+	end
+end
+plr.CharacterAdded:Connect(onCharacter)
+if plr.Character then
+	task.spawn(onCharacter, plr.Character)
+end
+
+------------------------------------------------------------------
+-- الموت والنهاية
+------------------------------------------------------------------
+local function onDied()
+	clearGhosts()
+	destroyStalker()
+	busy = false
+	ToServer:FireServer("Busy", false)
+	TweenService:Create(black, TweenInfo.new(2), { BackgroundTransparency = 0.15 }):Play()
+	task.spawn(title, "ماتت..", 2.5)
+end
+
+local function onEnding()
+	fade(0, 3)
+	task.wait(3.2)
+	subBox.Visible = false
+	missionLbl.Visible = false
+	waveHud.Visible = false
+	bigLbl.Text = "النهاية\nنجوت من الحارة المسكونة.. هل ستعود؟"
+	TweenService:Create(bigLbl, TweenInfo.new(1.5), { TextTransparency = 0 }):Play()
+end
+
+------------------------------------------------------------------
+-- استقبال أحداث السيرفر
+------------------------------------------------------------------
+local digits = { "_", "_", "_", "_" }
+
+ToClient.OnClientEvent:Connect(function(name, a, b, c)
+	if name == "PlayIntro" then
+		task.spawn(playIntro)
+	elseif name == "Sub" then
+		task.spawn(say, a, b, c)
+	elseif name == "Mission" then
+		setMission(a, b)
+	elseif name == "Sfx" then
+		sfx(a)
+	elseif name == "NoteDigit" then
+		digits[a] = tostring(b)
+		codeHud.Visible = true
+		codeHud.Text = "الرمز: " .. table.concat(digits, " ")
+	elseif name == "Keypad" then
+		entry = ""
+		kpShow()
+		kp.Visible = true
+	elseif name == "CodeResult" then
+		if a then
+			kp.Visible = false
+		else
+			flash(rgb(255, 0, 0), 0.5, 0.5)
+			kpDisp.Text = "خطأ!"
+			task.delay(0.8, kpShow)
+		end
+	elseif name == "PhotoResult" then
+		if not a then
+			task.spawn(say, "أنا", "ما ظهر الدليل بوضوح.. قرّب ووجّه الكاميرا عليه.", 2)
+		end
+	elseif name == "Stalker" then
+		stalkerOn = a
+		stNext = os.clock() + 15
+	elseif name == "Halluc" then
+		hallucOn = a
+	elseif name == "Rituals" then
+		ritualSpots = a
+		ritualDone = {}
+	elseif name == "Wave" then
+		startWave(a)
+	elseif name == "Died" then
+		onDied()
+	elseif name == "Revived" then
+		fade(1, 2)
+	elseif name == "Ending" then
+		task.spawn(onEnding)
+	end
+end)
+
+ToServer:FireServer("ClientReady")
+]]></ProtectedString></Properties></Item></Item></Item>
+</roblox>
